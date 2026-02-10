@@ -114,6 +114,110 @@ func TestNewIteratorConcurrency(t *testing.T) {
 	}
 }
 
+// TestSetBatchMatchesSequential verifies that SetBatch produces the same
+// Merkle root as sequential Set/Remove calls.
+func TestSetBatchMatchesSequential(t *testing.T) {
+	pairs := []BatchPair{
+		{Key: []byte("apple"), Value: []byte("red")},
+		{Key: []byte("banana"), Value: []byte("yellow")},
+		{Key: []byte("cherry"), Value: []byte("dark")},
+		{Key: []byte("date"), Value: []byte("brown")},
+		{Key: []byte("elderberry"), Value: []byte("purple")},
+		{Key: []byte("fig"), Value: []byte("green")},
+		{Key: []byte("grape"), Value: []byte("violet")},
+	}
+
+	// Sequential approach
+	seqTree := setupMutableTree(false)
+	for _, p := range pairs {
+		_, err := seqTree.Set(p.Key, p.Value)
+		require.NoError(t, err)
+	}
+	seqHash := seqTree.WorkingHash()
+
+	// Batch approach
+	batchTree := setupMutableTree(false)
+	err := batchTree.SetBatch(pairs)
+	require.NoError(t, err)
+	batchHash := batchTree.WorkingHash()
+
+	require.Equal(t, seqHash, batchHash, "SetBatch must produce identical Merkle root as sequential Set")
+}
+
+// TestSetBatchWithDeletes verifies SetBatch handles interleaved sets and deletes.
+func TestSetBatchWithDeletes(t *testing.T) {
+	// Setup: create a tree with some initial data
+	seqTree := setupMutableTree(false)
+	batchTree := setupMutableTree(false)
+
+	initial := []BatchPair{
+		{Key: []byte("a"), Value: []byte("1")},
+		{Key: []byte("b"), Value: []byte("2")},
+		{Key: []byte("c"), Value: []byte("3")},
+		{Key: []byte("d"), Value: []byte("4")},
+	}
+	for _, p := range initial {
+		_, err := seqTree.Set(p.Key, p.Value)
+		require.NoError(t, err)
+		_, err = batchTree.Set(p.Key, p.Value)
+		require.NoError(t, err)
+	}
+	seqTree.SaveVersion()
+	batchTree.SaveVersion()
+
+	// Apply mixed set/delete batch
+	changes := []BatchPair{
+		{Key: []byte("a"), Value: []byte("updated")},
+		{Key: []byte("b"), Delete: true},
+		{Key: []byte("e"), Value: []byte("5")},
+	}
+
+	// Sequential
+	for _, p := range changes {
+		if p.Delete {
+			seqTree.Remove(p.Key)
+		} else {
+			seqTree.Set(p.Key, p.Value)
+		}
+	}
+
+	// Batch
+	err := batchTree.SetBatch(changes)
+	require.NoError(t, err)
+
+	require.Equal(t, seqTree.WorkingHash(), batchTree.WorkingHash(),
+		"SetBatch with deletes must produce identical Merkle root")
+}
+
+// TestSetBatchLargeScaleSorted tests SetBatch with many sorted keys.
+func TestSetBatchLargeScaleSorted(t *testing.T) {
+	seqTree := setupMutableTree(false)
+	batchTree := setupMutableTree(false)
+
+	n := 500
+	pairs := make([]BatchPair, n)
+	for i := 0; i < n; i++ {
+		pairs[i] = BatchPair{
+			Key:   []byte(fmt.Sprintf("key-%05d", i)),
+			Value: []byte(fmt.Sprintf("val-%05d", i)),
+		}
+	}
+	// Already sorted by key
+
+	// Sequential
+	for _, p := range pairs {
+		_, err := seqTree.Set(p.Key, p.Value)
+		require.NoError(t, err)
+	}
+
+	// Batch
+	err := batchTree.SetBatch(pairs)
+	require.NoError(t, err)
+
+	require.Equal(t, seqTree.WorkingHash(), batchTree.WorkingHash(),
+		"Large-scale SetBatch must produce identical Merkle root")
+}
+
 func TestDelete(t *testing.T) {
 	tree := setupMutableTree(false)
 

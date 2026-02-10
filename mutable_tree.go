@@ -44,6 +44,7 @@ type MutableTree struct {
 	unsavedFastNodeRemovals  *sync.Map      // map[string]interface{} FastNodes that have not yet been removed from disk
 	ndb                      *nodeDB
 	skipFastStorageUpgrade   bool // If true, the tree will work like no fast storage and always not upgrade fast storage
+	batchMode                bool // When true, clone() skips copying unsaved nodes (in-place mutation)
 
 	mtx sync.Mutex
 }
@@ -309,23 +310,21 @@ func (tree *MutableTree) recursiveSetLeaf(node *Node, key []byte, value []byte) 
 	}
 	switch bytes.Compare(key, node.key) {
 	case -1: // setKey < leafKey
-		return &Node{
-			key:           node.key,
-			subtreeHeight: 1,
-			size:          2,
-			nodeKey:       nil,
-			leftNode:      NewNode(key, value),
-			rightNode:     node,
-		}, false, nil
+		inner := acquireNode()
+		inner.key = node.key
+		inner.subtreeHeight = 1
+		inner.size = 2
+		inner.leftNode = NewNode(key, value)
+		inner.rightNode = node
+		return inner, false, nil
 	case 1: // setKey > leafKey
-		return &Node{
-			key:           key,
-			subtreeHeight: 1,
-			size:          2,
-			nodeKey:       nil,
-			leftNode:      node,
-			rightNode:     NewNode(key, value),
-		}, false, nil
+		inner := acquireNode()
+		inner.key = key
+		inner.subtreeHeight = 1
+		inner.size = 2
+		inner.leftNode = node
+		inner.rightNode = NewNode(key, value)
+		return inner, false, nil
 	default:
 		return NewNode(key, value), true, nil
 	}
@@ -1073,6 +1072,41 @@ func (tree *MutableTree) saveNewNodes(version int64) error {
 		node.leftNode, node.rightNode = nil, nil
 	}
 
+	return nil
+}
+
+// BatchPair represents a key-value pair for batch operations.
+// If Delete is true, the key will be removed from the tree.
+type BatchPair struct {
+	Key    []byte
+	Value  []byte
+	Delete bool
+}
+
+// SetBatch applies multiple key-value pairs to the tree efficiently.
+// Pairs MUST be pre-sorted by key for optimal performance.
+// This method enables batch mode which allows clone() to skip copying unsaved
+// nodes — consecutive sorted writes share cloned internal nodes, reducing
+// allocations from O(N*H) to ~O(N+H) where N is writes and H is tree height.
+//
+// IMPORTANT: This method must NOT be called concurrently with other mutations
+// on the same tree. It is designed for single-threaded batch application of
+// pre-sorted writes (e.g., Block-STM commit phase).
+func (tree *MutableTree) SetBatch(pairs []BatchPair) error {
+	tree.batchMode = true
+	defer func() { tree.batchMode = false }()
+
+	for _, p := range pairs {
+		if p.Delete {
+			if _, _, err := tree.Remove(p.Key); err != nil {
+				return err
+			}
+		} else {
+			if _, err := tree.Set(p.Key, p.Value); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 

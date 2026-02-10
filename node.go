@@ -11,12 +11,44 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 
 	"github.com/cosmos/iavl/cache"
 
 	"github.com/cosmos/iavl/internal/color"
 	"github.com/cosmos/iavl/internal/encoding"
 )
+
+// nodePool provides reusable Node objects to reduce GC pressure from clone().
+// Each clone() during tree mutation allocates a Node that lives only until SaveVersion(),
+// making it ideal for pooling.
+var nodePool = sync.Pool{
+	New: func() interface{} { return &Node{} },
+}
+
+// acquireNode gets a zeroed Node from the pool.
+func acquireNode() *Node {
+	return nodePool.Get().(*Node)
+}
+
+// releaseNode returns a Node to the pool after clearing all fields.
+func releaseNode(n *Node) {
+	if n == nil {
+		return
+	}
+	n.key = nil
+	n.value = nil
+	n.hash = nil
+	n.nodeKey = nil
+	n.leftNodeKey = nil
+	n.rightNodeKey = nil
+	n.leftNode = nil
+	n.rightNode = nil
+	n.size = 0
+	n.subtreeHeight = 0
+	n.isLegacy = false
+	nodePool.Put(n)
+}
 
 const (
 	// ModeLegacyLeftNode is the mode for legacy left child in the node encoding/decoding.
@@ -293,12 +325,23 @@ func (node *Node) String() string {
 }
 
 // clone creates a shallow copy of a node with its hash set to nil.
+// When the tree is in batch mode and the node is unsaved (nodeKey == nil),
+// it returns the node itself — safe to mutate in place since these nodes
+// were created during the current version and no saved version references them.
 func (node *Node) clone(tree *MutableTree) (*Node, error) {
 	if node.isLeaf() {
 		return nil, ErrCloneLeafNode
 	}
 
-	// ensure get children
+	// Fast path (batch mode only): unsaved nodes can be mutated in place.
+	// This is only safe when mutations are single-threaded per tree, which
+	// is guaranteed by SetBatch(). Regular Set()/Remove() calls may be
+	// concurrent so we always clone there.
+	if tree.batchMode && node.nodeKey == nil {
+		return node, nil
+	}
+
+	// Standard path: load children and create a pooled copy.
 	var err error
 	leftNode := node.leftNode
 	rightNode := node.rightNode
@@ -315,17 +358,17 @@ func (node *Node) clone(tree *MutableTree) (*Node, error) {
 		node.rightNode = nil
 	}
 
-	return &Node{
-		key:           node.key,
-		subtreeHeight: node.subtreeHeight,
-		size:          node.size,
-		hash:          nil,
-		nodeKey:       nil,
-		leftNodeKey:   node.leftNodeKey,
-		rightNodeKey:  node.rightNodeKey,
-		leftNode:      leftNode,
-		rightNode:     rightNode,
-	}, nil
+	cloned := acquireNode()
+	cloned.key = node.key
+	cloned.subtreeHeight = node.subtreeHeight
+	cloned.size = node.size
+	cloned.hash = nil
+	cloned.nodeKey = nil
+	cloned.leftNodeKey = node.leftNodeKey
+	cloned.rightNodeKey = node.rightNodeKey
+	cloned.leftNode = leftNode
+	cloned.rightNode = rightNode
+	return cloned, nil
 }
 
 func (node *Node) isLeaf() bool {
