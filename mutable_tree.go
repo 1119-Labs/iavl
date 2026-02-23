@@ -825,7 +825,10 @@ func (tree *MutableTree) getUnsavedFastNodeRemovals() map[string]interface{} {
 
 // addUnsavedAddition stores an addition into the unsaved additions map
 func (tree *MutableTree) addUnsavedAddition(key []byte, node *fastnode.Node) {
-	skey := ibytes.UnsafeBytesToStr(key)
+	// Use safe string copy for Store (key persists in sync.Map).
+	// UnsafeBytesToStr is only safe for ephemeral lookups/deletes;
+	// Go 1.24+ HashTrieMap panics when unsafe-aliased keys mutate in-place.
+	skey := string(key)
 	tree.unsavedFastNodeRemovals.Delete(skey)
 	tree.unsavedFastNodeAdditions.Store(skey, node)
 }
@@ -854,7 +857,8 @@ func (tree *MutableTree) saveFastNodeAdditions(batchCommmit bool) error {
 
 // addUnsavedRemoval adds a removal to the unsaved removals map
 func (tree *MutableTree) addUnsavedRemoval(key []byte) {
-	skey := ibytes.UnsafeBytesToStr(key)
+	// Use safe string copy for Store (same reason as addUnsavedAddition).
+	skey := string(key)
 	tree.unsavedFastNodeAdditions.Delete(skey)
 	tree.unsavedFastNodeRemovals.Store(skey, true)
 }
