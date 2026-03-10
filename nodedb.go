@@ -492,7 +492,10 @@ func (ndb *nodeDB) deleteLegacyNodes(version int64, nk []byte) error {
 }
 
 // deleteLegacyVersions deletes all legacy versions from disk.
-func (ndb *nodeDB) deleteLegacyVersions(legacyLatestVersion int64) error {
+// nextVersionRootKey is the root key of legacyLatestVersion+1, pre-read by the caller on the
+// main thread before any concurrent deleteVersion calls can remove it.  Passing it as a
+// parameter eliminates the race between this goroutine and deleteVersion(legacyLatestVersion+1).
+func (ndb *nodeDB) deleteLegacyVersions(legacyLatestVersion int64, nextVersionRootKey []byte) error {
 	count := 0
 
 	checkDeletePause := func() {
@@ -503,8 +506,10 @@ func (ndb *nodeDB) deleteLegacyVersions(legacyLatestVersion int64) error {
 		}
 	}
 
-	// Delete the last version for the legacyLastVersion
-	if err := ndb.traverseOrphans(legacyLatestVersion, legacyLatestVersion+1, func(orphan *Node) error {
+	// Delete orphans between legacyLatestVersion and legacyLatestVersion+1.
+	// Use the pre-read nextVersionRootKey instead of re-reading from DB, which avoids a race
+	// with deleteVersion(legacyLatestVersion+1) running concurrently on the main thread.
+	if err := ndb.traverseOrphansWithRoots(legacyLatestVersion, nextVersionRootKey, func(orphan *Node) error {
 		checkDeletePause()
 		return ndb.batch.Delete(ndb.legacyNodeKey(orphan.hash))
 	}); err != nil {
@@ -586,7 +591,6 @@ func (ndb *nodeDB) DeleteVersionsFrom(fromVersion int64) error {
 	err = ndb.traverseRange(nodeKeyPrefixFormat.KeyInt64(fromVersion), nodeKeyPrefixFormat.KeyInt64(latest+1), func(k, v []byte) error {
 		return ndb.batch.Delete(k)
 	})
-
 	if err != nil {
 		return err
 	}
@@ -636,10 +640,17 @@ func (ndb *nodeDB) DeleteVersionsTo(toVersion int64) error {
 
 	// Delete the legacy versions
 	if legacyLatestVersion >= first {
+		// Snapshot the next version's root key on the main thread, before any deleteVersion
+		// call can remove it.  The goroutine uses this snapshot so it never races against
+		// the main thread's concurrent deleteVersion(legacyLatestVersion+1).
+		nextVersionRootKey, err := ndb.GetRoot(legacyLatestVersion + 1)
+		if err != nil {
+			return err
+		}
 		// reset the legacy latest version forcibly to avoid multiple calls
 		ndb.resetLegacyLatestVersion(-1)
 		go func() {
-			if err := ndb.deleteLegacyVersions(legacyLatestVersion); err != nil {
+			if err := ndb.deleteLegacyVersions(legacyLatestVersion, nextVersionRootKey); err != nil {
 				ndb.logger.Error("Error deleting legacy versions", "err", err)
 			}
 		}()
@@ -1022,6 +1033,13 @@ func (ndb *nodeDB) traverseOrphans(prevVersion, curVersion int64, fn func(*Node)
 		return err
 	}
 
+	return ndb.traverseOrphansWithRoots(prevVersion, curKey, fn)
+}
+
+// traverseOrphansWithRoots is like traverseOrphans but accepts the current version's root key
+// directly instead of reading it from the DB.  This allows the caller to snapshot the root key
+// before any concurrent writes can remove it.
+func (ndb *nodeDB) traverseOrphansWithRoots(prevVersion int64, curKey []byte, fn func(*Node) error) error {
 	curIter, err := NewNodeIterator(curKey, ndb)
 	if err != nil {
 		return err
@@ -1257,7 +1275,6 @@ func (ndb *nodeDB) String() (string, error) {
 		index++
 		return nil
 	})
-
 	if err != nil {
 		return "", err
 	}
