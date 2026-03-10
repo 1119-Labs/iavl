@@ -644,7 +644,7 @@ func (ndb *nodeDB) DeleteVersionsTo(toVersion int64) error {
 		// call can remove it.  The goroutine uses this snapshot so it never races against
 		// the main thread's concurrent deleteVersion(legacyLatestVersion+1).
 		nextVersionRootKey, err := ndb.GetRoot(legacyLatestVersion + 1)
-		if err != nil {
+		if err != nil && err != ErrVersionDoesNotExist {
 			return err
 		}
 		// reset the legacy latest version forcibly to avoid multiple calls
