@@ -1998,3 +1998,206 @@ func TestPruningReferenceRootChildNode(t *testing.T) {
 	_, err = tree.Set([]byte("foo"), []byte("bar*"))
 	require.NoError(t, err)
 }
+
+// TestPruningRefRootChildGet verifies that Get (read path) also works after pruning
+// reformats a child node from {version,1} to {version,0}.
+func TestPruningRefRootChildGet(t *testing.T) {
+	db, err := dbm.NewDB("test", "memdb", "")
+	require.NoError(t, err)
+	defer db.Close()
+
+	tree := NewMutableTree(db, 0, true, log.NewNopLogger())
+
+	_, err = tree.Set([]byte("foo"), []byte("bar"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion() // V=1: root = {1,1}
+	require.NoError(t, err)
+
+	_, _, err = tree.SaveVersion() // V=2: reference root → {1,1}
+	require.NoError(t, err)
+
+	_, err = tree.Set([]byte("foo1"), []byte("baz"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion() // V=3: root {3,1}, left={1,1}, right={3,2}
+	require.NoError(t, err)
+
+	require.NoError(t, tree.DeleteVersionsTo(1))
+
+	// Get must resolve {1,1} via the {version,0} fallback.
+	val, err := tree.Get([]byte("foo"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("bar"), val)
+
+	val, err = tree.Get([]byte("foo1"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("baz"), val)
+}
+
+// TestPruningRefRootChildLongChain verifies that a long chain of reference versions
+// (simulating pruning=default with keep-recent=362880) does not corrupt child pointers.
+func TestPruningRefRootChildLongChain(t *testing.T) {
+	db, err := dbm.NewDB("test", "memdb", "")
+	require.NoError(t, err)
+	defer db.Close()
+
+	tree := NewMutableTree(db, 0, true, log.NewNopLogger())
+
+	_, err = tree.Set([]byte("aaa"), []byte("v1"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion() // V=1: leaf {1,1}
+	require.NoError(t, err)
+
+	// 50 empty reference versions on top of V=1.
+	for i := 2; i <= 51; i++ {
+		_, _, err = tree.SaveVersion()
+		require.NoError(t, err)
+	}
+
+	// V=52: add a second key — root {52,1} embeds leftNodeKey={1,1}.
+	_, err = tree.Set([]byte("zzz"), []byte("v52"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion()
+	require.NoError(t, err)
+
+	// 20 more empty reference versions on top of V=52.
+	for i := 53; i <= 72; i++ {
+		_, _, err = tree.SaveVersion()
+		require.NoError(t, err)
+	}
+
+	// Prune everything up to V=51 — this reformats {1,1}→{1,0}.
+	require.NoError(t, tree.DeleteVersionsTo(51))
+
+	// Both keys must still be readable via the live tree.
+	val, err := tree.Get([]byte("aaa"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v1"), val)
+
+	val, err = tree.Get([]byte("zzz"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v52"), val)
+
+	// And writable.
+	_, err = tree.Set([]byte("aaa"), []byte("v1_updated"))
+	require.NoError(t, err)
+}
+
+// TestPruningRefRootChildIterator verifies that a forward iterator traverses all keys
+// correctly after the pruning reformat of a child-referenced root node.
+func TestPruningRefRootChildIterator(t *testing.T) {
+	db, err := dbm.NewDB("test", "memdb", "")
+	require.NoError(t, err)
+	defer db.Close()
+
+	tree := NewMutableTree(db, 0, true, log.NewNopLogger())
+
+	_, err = tree.Set([]byte("foo"), []byte("bar"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion() // V=1: {1,1}
+	require.NoError(t, err)
+
+	_, _, err = tree.SaveVersion() // V=2: reference root
+	require.NoError(t, err)
+
+	_, err = tree.Set([]byte("foo1"), []byte("baz"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion() // V=3: root {3,1}, left={1,1}
+	require.NoError(t, err)
+
+	require.NoError(t, tree.DeleteVersionsTo(1))
+
+	iter, err := tree.Iterator(nil, nil, true)
+	require.NoError(t, err)
+	defer iter.Close()
+
+	var keys []string
+	for ; iter.Valid(); iter.Next() {
+		keys = append(keys, string(iter.Key()))
+	}
+	require.NoError(t, iter.Error())
+	require.Equal(t, []string{"foo", "foo1"}, keys)
+}
+
+// TestPruningRefRootChildReload verifies that loading the tree fresh from disk after
+// the prune correctly resolves the reformatted child node key.
+func TestPruningRefRootChildReload(t *testing.T) {
+	db, err := dbm.NewDB("test", "memdb", "")
+	require.NoError(t, err)
+	defer db.Close()
+
+	tree := NewMutableTree(db, 0, true, log.NewNopLogger())
+
+	_, err = tree.Set([]byte("foo"), []byte("bar"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion() // V=1
+	require.NoError(t, err)
+
+	_, _, err = tree.SaveVersion() // V=2: reference root
+	require.NoError(t, err)
+
+	_, err = tree.Set([]byte("foo1"), []byte("baz"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion() // V=3: root embeds {1,1} as child
+	require.NoError(t, err)
+
+	require.NoError(t, tree.DeleteVersionsTo(1))
+
+	// Load a fresh tree from DB — simulates a node restart after pruning.
+	tree2 := NewMutableTree(db, 0, true, log.NewNopLogger())
+	_, err = tree2.Load()
+	require.NoError(t, err)
+
+	val, err := tree2.Get([]byte("foo"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("bar"), val)
+
+	val, err = tree2.Get([]byte("foo1"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("baz"), val)
+}
+
+// TestPruningRefRootChildMultipleStalePointers verifies that a tree where multiple
+// versions each embed {1,1} as a child pointer all survive the reformat correctly.
+// Scenario: V=1 leaf, V=2 ref, V=3 two-key tree (left={1,1}), V=4 three-key tree
+// (also descends through {1,1} on the left spine). Both V=3 and V=4 roots hold
+// indirect references to {1,1}. Prune V=1 and verify reads on V=3 and V=4.
+func TestPruningRefRootChildMultipleStalePointers(t *testing.T) {
+	db, err := dbm.NewDB("test", "memdb", "")
+	require.NoError(t, err)
+	defer db.Close()
+
+	tree := NewMutableTree(db, 0, true, log.NewNopLogger())
+
+	_, err = tree.Set([]byte("aaa"), []byte("v1"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion() // V=1: leaf {1,1}="aaa"
+	require.NoError(t, err)
+
+	_, _, err = tree.SaveVersion() // V=2: reference root → {1,1}
+	require.NoError(t, err)
+
+	_, err = tree.Set([]byte("mmm"), []byte("v3"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion() // V=3: root {3,1}, left={1,1}, right={3,2}
+	require.NoError(t, err)
+
+	_, err = tree.Set([]byte("zzz"), []byte("v4"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion() // V=4: root {4,1}, subtree still contains {1,1}
+	require.NoError(t, err)
+
+	require.NoError(t, tree.DeleteVersionsTo(1))
+
+	// All three keys must be readable on the current (V=4) tree.
+	val, err := tree.Get([]byte("aaa"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v1"), val)
+
+	val, err = tree.Get([]byte("mmm"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v3"), val)
+
+	val, err = tree.Get([]byte("zzz"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v4"), val)
+}
