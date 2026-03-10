@@ -155,7 +155,7 @@ func (ndb *nodeDB) GetNode(nk []byte) (*Node, error) {
 			reformattedKey := ndb.nodeKey((&NodeKey{version: nKey.version, nonce: 0}).GetKey())
 			buf, err = ndb.db.Get(reformattedKey)
 			if err != nil {
-				return nil, fmt.Errorf("can't get reformatted node %v: %v", nk, err)
+				return nil, fmt.Errorf("can't get reformatted node %v: %v", reformattedKey, err)
 			}
 			if buf != nil {
 				nodeKey = reformattedKey

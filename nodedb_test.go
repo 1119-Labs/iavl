@@ -438,8 +438,7 @@ func TestDeleteVersionsFromNoDeadlock(t *testing.T) {
 	require.Contains(t, err.Error(), fmt.Sprintf("unable to delete version %v with 2 active readers", targetVersion+2))
 }
 
-// TestDeleteLegacyVersionsNextVersionMissing validates the fix for the race condition in
-// TestDeleteLegacyVersionsSnapshotedRootKey verifies that deleteLegacyVersions uses the
+// TestDeleteLegacyVersionsSnapshottedRootKey verifies that deleteLegacyVersions uses the
 // nextVersionRootKey passed by the caller rather than re-reading it from the DB.  This covers
 // the race that was present before the fix: the goroutine previously called GetRoot internally,
 // which could return ErrVersionDoesNotExist after deleteVersion(legacyLatest+1) committed on
@@ -448,7 +447,7 @@ func TestDeleteVersionsFromNoDeadlock(t *testing.T) {
 // The test simulates the post-race state (next version root deleted from DB) and passes a
 // pre-read nil key (empty next-version root) directly.  deleteLegacyVersions must complete
 // and clean up legacy root keys without error.
-func TestDeleteLegacyVersionsSnapshotedRootKey(t *testing.T) {
+func TestDeleteLegacyVersionsSnapshottedRootKey(t *testing.T) {
 	memDB := db.NewMemDB()
 	ndb := newNodeDB(memDB, 0, DefaultOptions(), log.NewNopLogger())
 
