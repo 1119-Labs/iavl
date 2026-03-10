@@ -1960,13 +1960,14 @@ func TestWorkingHashWithInitialVersion(t *testing.T) {
 // but a newer parent node still holds a child pointer to the old {version, 1} key.
 //
 // Sequence that triggers the bug:
-//   V=1: set "foo"  → single leaf, root = {1,1}
-//   V=2: empty save → reference root pointing to {1,1}
-//   V=3: set "foo1" → new internal root {3,1} with leftNodeKey={1,1}, rightNodeKey={3,2}
-//   DeleteVersionsTo(1):
-//     deleteVersion(1) detects nextRoot(2)={1,1}==literalRootKey → rewrites node
-//     to {1,0} and deletes {1,1}. {3,1}.leftNodeKey still encodes {1,1}.
-//   Subsequent Get / Set traverses {3,1} → calls GetNode({1,1}) → nil → panic.
+//
+//	V=1: set "foo"  → single leaf, root = {1,1}
+//	V=2: empty save → reference root pointing to {1,1}
+//	V=3: set "foo1" → new internal root {3,1} with leftNodeKey={1,1}, rightNodeKey={3,2}
+//	DeleteVersionsTo(1):
+//	  deleteVersion(1) detects nextRoot(2)={1,1}==literalRootKey → rewrites node
+//	  to {1,0} and deletes {1,1}. {3,1}.leftNodeKey still encodes {1,1}.
+//	Subsequent Get / Set traverses {3,1} → calls GetNode({1,1}) → nil → panic.
 func TestPruningReferenceRootChildNode(t *testing.T) {
 	db, err := dbm.NewDB("test", "memdb", "")
 	require.NoError(t, err)
