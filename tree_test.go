@@ -1954,3 +1954,46 @@ func TestWorkingHashWithInitialVersion(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, commitHash1, commitHash)
 }
+
+// TestPruningReferenceRootChildNode is a regression test for the "Value missing for key"
+// panic that occurs when pruning reformats a root node from {version, 1} to {version, 0}
+// but a newer parent node still holds a child pointer to the old {version, 1} key.
+//
+// Sequence that triggers the bug:
+//   V=1: set "foo"  → single leaf, root = {1,1}
+//   V=2: empty save → reference root pointing to {1,1}
+//   V=3: set "foo1" → new internal root {3,1} with leftNodeKey={1,1}, rightNodeKey={3,2}
+//   DeleteVersionsTo(1):
+//     deleteVersion(1) detects nextRoot(2)={1,1}==literalRootKey → rewrites node
+//     to {1,0} and deletes {1,1}. {3,1}.leftNodeKey still encodes {1,1}.
+//   Subsequent Get / Set traverses {3,1} → calls GetNode({1,1}) → nil → panic.
+func TestPruningReferenceRootChildNode(t *testing.T) {
+	db, err := dbm.NewDB("test", "memdb", "")
+	require.NoError(t, err)
+	defer db.Close()
+
+	tree := NewMutableTree(db, 0, true, log.NewNopLogger())
+
+	// V=1: single key
+	_, err = tree.Set([]byte("foo"), []byte("bar"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion()
+	require.NoError(t, err)
+
+	// V=2: empty (reference root → {1,1})
+	_, _, err = tree.SaveVersion()
+	require.NoError(t, err)
+
+	// V=3: second key — {1,1} becomes a child of the new root {3,1}
+	_, err = tree.Set([]byte("foo1"), []byte("bar"))
+	require.NoError(t, err)
+	_, _, err = tree.SaveVersion()
+	require.NoError(t, err)
+
+	// Pruning V=1 reformats {1,1}→{1,0}, but {3,1} still stores leftNodeKey={1,1}.
+	require.NoError(t, tree.DeleteVersionsTo(1))
+
+	// Without the fix, traversing the tree calls GetNode({1,1}), which is now nil → panic.
+	_, err = tree.Set([]byte("foo"), []byte("bar*"))
+	require.NoError(t, err)
+}

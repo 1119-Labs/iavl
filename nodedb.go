@@ -145,6 +145,23 @@ func (ndb *nodeDB) GetNode(nk []byte) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("can't get node %v: %v", nk, err)
 	}
+	if buf == nil && !isLegcyNode {
+		// A root node with nonce=1 may have been reformatted to nonce=0 during pruning
+		// (deleteVersion rewrites the node under key {version,0} and deletes {version,1}).
+		// Child pointers written before the prune still reference {version,1}, so fall
+		// back to {version,0} when the primary key is missing.
+		nKey := GetNodeKey(nk)
+		if nKey.nonce == 1 {
+			reformattedKey := ndb.nodeKey((&NodeKey{version: nKey.version, nonce: 0}).GetKey())
+			buf, err = ndb.db.Get(reformattedKey)
+			if err != nil {
+				return nil, fmt.Errorf("can't get reformatted node %v: %v", nk, err)
+			}
+			if buf != nil {
+				nodeKey = reformattedKey
+			}
+		}
+	}
 	if buf == nil {
 		return nil, fmt.Errorf("Value missing for key %v corresponding to nodeKey %x", nk, nodeKey)
 	}
