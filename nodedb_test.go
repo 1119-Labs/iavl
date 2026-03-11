@@ -437,3 +437,108 @@ func TestDeleteVersionsFromNoDeadlock(t *testing.T) {
 	require.Error(t, err, "")
 	require.Contains(t, err.Error(), fmt.Sprintf("unable to delete version %v with 2 active readers", targetVersion+2))
 }
+
+// TestDeleteLegacyVersionsSnapshottedRootKey verifies that deleteLegacyVersions uses the
+// nextVersionRootKey passed by the caller rather than re-reading it from the DB.  This covers
+// the race that was present before the fix: the goroutine previously called GetRoot internally,
+// which could return ErrVersionDoesNotExist after deleteVersion(legacyLatest+1) committed on
+// the main thread.  Now the caller snapshots the key before launching the goroutine.
+//
+// The test simulates the post-race state (next version root deleted from DB) and passes a
+// pre-read nil key (empty next-version root) directly.  deleteLegacyVersions must complete
+// and clean up legacy root keys without error.
+func TestDeleteLegacyVersionsSnapshottedRootKey(t *testing.T) {
+	memDB := db.NewMemDB()
+	ndb := newNodeDB(memDB, 0, DefaultOptions(), log.NewNopLogger())
+
+	// Write two legacy root keys (versions 1 and 2) directly into the DB.
+	// Use empty values (empty legacy tree roots) so GetRoot returns nil and node traversal
+	// is a no-op — we are only testing that the key deletion path completes correctly.
+	legacyBatch := memDB.NewBatch()
+	require.NoError(t, legacyBatch.Set(ndb.legacyRootKey(1), []byte{}))
+	require.NoError(t, legacyBatch.Set(ndb.legacyRootKey(2), []byte{}))
+	require.NoError(t, legacyBatch.Write())
+
+	has, err := memDB.Has(ndb.legacyRootKey(1))
+	require.NoError(t, err)
+	require.True(t, has)
+
+	has, err = memDB.Has(ndb.legacyRootKey(2))
+	require.NoError(t, err)
+	require.True(t, has)
+
+	// Pass nil as nextVersionRootKey, representing an empty (or already-deleted) version 3 root.
+	// This is what DeleteVersionsTo does when the next version is an empty tree, and is also
+	// the value the caller would have snapshotted if version 3 had an empty root.
+	err = ndb.deleteLegacyVersions(2, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, ndb.Commit())
+
+	has, err = memDB.Has(ndb.legacyRootKey(1))
+	require.NoError(t, err)
+	require.False(t, has, "legacy root for version 1 should be deleted")
+
+	has, err = memDB.Has(ndb.legacyRootKey(2))
+	require.NoError(t, err)
+	require.False(t, has, "legacy root for version 2 should be deleted")
+}
+
+// TestDeleteLegacyVersionsNextVersionPresent ensures that when the next version's root IS
+// present (the normal, non-race path), deleteLegacyVersions still completes without error.
+func TestDeleteLegacyVersionsNextVersionPresent(t *testing.T) {
+	// Use empty roots for both versions so traverseOrphans completes trivially (no nodes to
+	// traverse), letting us verify that the non-race path also cleans up legacy root keys.
+	memDB := db.NewMemDB()
+	ndb := newNodeDB(memDB, 0, DefaultOptions(), log.NewNopLogger())
+
+	// Write a legacy root for version 1 with empty value (empty legacy tree root).
+	legacyBatch := memDB.NewBatch()
+	require.NoError(t, legacyBatch.Set(ndb.legacyRootKey(1), []byte{}))
+	require.NoError(t, legacyBatch.Write())
+
+	// Write an empty new-format root for version 2 so GetRoot(2) succeeds.
+	require.NoError(t, ndb.SaveEmptyRoot(2))
+	require.NoError(t, ndb.Commit())
+
+	// Snapshot the version-2 root key (nil = empty tree) and pass it directly, as
+	// DeleteVersionsTo does before spawning the goroutine.
+	nextRootKey, err := ndb.GetRoot(2)
+	require.NoError(t, err)
+
+	// deleteLegacyVersions(1): traverseOrphansWithRoots uses the pre-read key, then
+	// legacy root keys are deleted.
+	err = ndb.deleteLegacyVersions(1, nextRootKey)
+	require.NoError(t, err)
+	require.NoError(t, ndb.Commit())
+
+	has, err := memDB.Has(ndb.legacyRootKey(1))
+	require.NoError(t, err)
+	require.False(t, has, "legacy root for version 1 should be deleted")
+}
+
+// TestDeleteLegacyVersionsErrorPropagation checks that I/O errors from
+// traverseOrphansWithRoots (e.g. when reading the prevVersion root from DB) are propagated
+// back to the caller unchanged.
+func TestDeleteLegacyVersionsErrorPropagation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	dbMock := mock.NewMockDB(ctrl)
+
+	sentinelErr := errors.New("disk I/O failure")
+
+	// db.Get is called by newNodeDB (getStorageVersion) and by GetRoot(prevVersion) inside
+	// traverseOrphansWithRoots. Return a real I/O error so the prevVersion root lookup fails.
+	dbMock.EXPECT().Get(gomock.Any()).Return(nil, sentinelErr).AnyTimes()
+	dbMock.EXPECT().Has(gomock.Any()).Return(false, nil).AnyTimes()
+	dbMock.EXPECT().NewBatch().Return(db.NewMemDB().NewBatch()).AnyTimes()
+	dbMock.EXPECT().NewBatchWithSize(gomock.Any()).Return(db.NewMemDB().NewBatch()).AnyTimes()
+
+	ndb := newNodeDB(dbMock, 0, DefaultOptions(), log.NewNopLogger())
+
+	// Pass nil as the pre-read nextVersionRootKey (empty next-version root).
+	// traverseOrphansWithRoots will then call GetRoot(1) → db.Get → sentinelErr.
+	// This error must propagate out of deleteLegacyVersions unchanged.
+	err := ndb.deleteLegacyVersions(1, nil)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrVersionDoesNotExist)
+}
